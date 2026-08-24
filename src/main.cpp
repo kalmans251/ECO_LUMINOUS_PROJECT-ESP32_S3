@@ -108,27 +108,31 @@ static void init_ble() {
 
     BLEService *pService = pServer->createService(SERVICE_UUID);
 
+    // 1. 비상 음성 알림 특성
     pCharEmergency = pService->createCharacteristic(
         CHAR_EMERGENCY_UUID,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharEmergency->addDescriptor(new BLE2902());
 
+    // 2. Radar 1 특성 (READ + NOTIFY 표준 구성)
     pCharRadar1 = pService->createCharacteristic(
         CHAR_RADAR1_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharRadar1->addDescriptor(new BLE2902());
 
+    // 3. Radar 2 특성 (READ + NOTIFY 표준 구성)
     pCharRadar2 = pService->createCharacteristic(
         CHAR_RADAR2_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharRadar2->addDescriptor(new BLE2902());
 
+    // 4. 오디오 스트림 특성
     pCharAudioStream = pService->createCharacteristic(
         CHAR_AUDIO_STREAM_UUID,
-        BLECharacteristic::PROPERTY_NOTIFY
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
     );
     pCharAudioStream->addDescriptor(new BLE2902());
 
@@ -138,7 +142,7 @@ static void init_ble() {
     pAdvertising->setScanResponse(true);
     pAdvertising->setMinPreferred(0x06);
     BLEDevice::startAdvertising();
-    Serial.println("[BLE] 서버 활성화됨");
+    Serial.println("[BLE] GATT 서버 활성화 완료 (R1/R2 표준 Descriptor 구성)");
 }
 
 // ----------------- 5. 오디오 신호 전처리 -----------------
@@ -316,7 +320,7 @@ static void parse_radar_stream(HardwareSerial &port, uint8_t *dest_buf, bool &ne
                     memcpy(dest_buf, tmp_buf, LD2450_FRAME_LEN);
                     new_flag = true;
                 }
-                state_idx = 0; // 프레임 완료 후 리셋
+                state_idx = 0;
             }
         }
     }
@@ -366,11 +370,11 @@ static void radar_task(void *arg) {
 
     while (true) {
         if (!g_voice_call_active) {
-            // UART 스트림 상시 수신 및 프레임 완성
+            // UART 수신 상시 처리
             parse_radar_stream(RadarSerial1, g_radar1_latest_frame, g_radar1_has_new, state1, tmp1);
             parse_radar_stream(RadarSerial2, g_radar2_latest_frame, g_radar2_has_new, state2, tmp2);
 
-            // 약 10Hz(100ms) 고정 주기로 캐시된 최신 유효 프레임을 BLE Notify
+            // 약 10Hz (100ms) 주기로 송출
             uint32_t now = millis();
             if (now - last_tx_ms >= 100) {
                 last_tx_ms = now;
@@ -380,6 +384,7 @@ static void radar_task(void *arg) {
                         pCharRadar1->setValue(g_radar1_latest_frame, LD2450_FRAME_LEN);
                         pCharRadar1->notify();
                         g_radar1_has_new = false;
+                        delay(10); // BLE 송신 버퍼 안전 딜레이
                     }
                     if (g_radar2_has_new && pCharRadar2 != nullptr) {
                         pCharRadar2->setValue(g_radar2_latest_frame, LD2450_FRAME_LEN);
@@ -436,7 +441,7 @@ void setup() {
     xTaskCreatePinnedToCore(audio_classifier_task, "audioTask", 32768, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(radar_task, "radarTask", 4096, nullptr, 1, nullptr, 0);
 
-    Serial.println("\n[SYSTEM READY] 시스템 가동 시작.");
+    Serial.println("\n[SYSTEM READY] ESP32-S3 시스템 정상 가동 시작.");
 }
 
 void loop() {
@@ -445,13 +450,13 @@ void loop() {
         prev_state = g_voice_call_active;
         if (g_voice_call_active) {
             Serial.println("[MODE CHANGE] >>> 관제소 음성 대화 모드 활성화 (AI/레이더 중단)");
-            if (g_ble_connected) {
+            if (g_ble_connected && pCharEmergency != nullptr) {
                 pCharEmergency->setValue("CALL_START");
                 pCharEmergency->notify();
             }
         } else {
             Serial.println("[MODE CHANGE] >>> 일반 대기 모드 복귀 (AI 추론 및 레이더 재개)");
-            if (g_ble_connected) {
+            if (g_ble_connected && pCharEmergency != nullptr) {
                 pCharEmergency->setValue("CALL_END");
                 pCharEmergency->notify();
             }
