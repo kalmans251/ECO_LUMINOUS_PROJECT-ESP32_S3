@@ -17,7 +17,7 @@
 
 // Edge Impulse 모델 헤더
 #define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW 4
-#include "model_inferencing.h"
+#include "dongjun1_inferencing.h"
 
 #ifndef EI_CLASSIFIER_SLICE_SIZE
 #define EI_CLASSIFIER_SLICE_SIZE (EI_CLASSIFIER_RAW_SAMPLE_COUNT / EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)
