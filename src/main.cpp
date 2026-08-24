@@ -96,11 +96,11 @@ static bool g_radar2_has_new = false;
 class ServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         g_ble_connected = true;
-        Serial.println("[BLE] WROOM 연결 완료");
+        Serial.println("🔗 [BLE] WROOM-32와 BLE 연결 성공!");
     }
     void onDisconnect(BLEServer* pServer) override {
         g_ble_connected = false;
-        Serial.println("[BLE] 연결 해제 -> 광고 재개");
+        Serial.println("⚡ [BLE] 연결 해제됨 -> 광고(Advertising) 재개");
         BLEDevice::startAdvertising();
     }
 };
@@ -109,13 +109,13 @@ class EmergencyCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pChar) override {
         String rxValue = pChar->getValue().c_str();
         if (rxValue.length() > 0) {
-            Serial.printf("[BLE RX] 원격 명령: %s\n", rxValue.c_str());
+            Serial.printf("📩 [BLE RX] 관제소 제어 명령: %s\n", rxValue.c_str());
             if (rxValue == "CALL_END") {
                 g_voice_call_active = false;
-                Serial.println("[SYSTEM] 관제소 명령: 통화 종료 -> 대기 복귀");
+                Serial.println("📞 [SYSTEM] 관제소 통화 종료 -> 대기 모드 복귀");
             } else if (rxValue == "CALL_START") {
                 g_voice_call_active = true;
-                Serial.println("[SYSTEM] 관제소 명령: 통화 활성화");
+                Serial.println("🚨 [SYSTEM] 관제소 통화 활성화 -> 음성 송출 모드");
             }
         }
     }
@@ -145,12 +145,22 @@ static void init_ble() {
     pCharAudioStream->addDescriptor(new BLE2902());
 
     pService->start();
+
+    // 31바이트 초과 방지를 위한 분할 광고 설정
     BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-    pAdv->addServiceUUID(SERVICE_UUID);
-    pAdv->setScanResponse(true);
+    
+    BLEAdvertisementData advData;
+    advData.setFlags(0x06);
+    advData.setCompleteServices(BLEUUID(SERVICE_UUID));
+    pAdv->setAdvertisementData(advData);
+
+    BLEAdvertisementData scanResponseData;
+    scanResponseData.setName("ESP32S3_EMERGENCY_SYSTEM");
+    pAdv->setScanResponseData(scanResponseData);
+
     pAdv->setMinPreferred(0x06);
-    BLEDevice::startAdvertising();
-    Serial.println("[BLE] GATT 서버 활성화 완료");
+    pAdv->start();
+    Serial.println("📢 [BLE] 31바이트 분할 광고 송출 시작 (GATT 서버 가동 완료)");
 }
 
 // ----------------- 5. 오디오 처리 및 I2S -----------------
@@ -286,7 +296,7 @@ static void process_inference_result(const ei_impulse_result_t &result, float mi
             g_last_detection_ms = millis();
             const char *korean_text = label_to_korean(best_label);
 
-            Serial.printf("🚨 [AI 감지 확정] %s (확신도: %.1f%%)\n", korean_text, best_confidence * 100.0f);
+            Serial.printf("🚨 [AI 키워드 확정] %s (확신도: %.1f%%)\n", korean_text, best_confidence * 100.0f);
 
             if (g_ble_connected && pCharEmergency != nullptr) {
                 pCharEmergency->setValue(korean_text);
@@ -336,7 +346,6 @@ static void audio_classifier_task(void *arg) {
         capture_microphone_samples();
 
         if (g_voice_call_active) {
-            // [통화 모드] 16kHz -> 8kHz 다운샘플링 후 Codec 2(2400bps) 3프레임(18B = 60ms) 묶음 전송
             if (g_ble_connected && g_audio_slice_size > 0 && pCharAudioStream != nullptr && g_c2_enc != nullptr) {
                 static uint8_t c2_batch_buf[18];
                 static int c2_batch_idx = 0;
@@ -358,7 +367,6 @@ static void audio_classifier_task(void *arg) {
                 }
             }
         } else {
-            // [대기 모드] AI 추론
             g_codec2_in_idx = 0;
             if (g_audio_slice_size > 0) {
                 signal_t signal;
@@ -416,10 +424,9 @@ static void radar_task(void *arg) {
     }
 }
 
-// ----------------- 8. 메인 셋업 및 루프 -----------------
-void setup() {
-    Serial.begin(115200);
-    delay(200);
+// ----------------- 8. [핵심] 시스템 메인 워커 태스크 (16KB 스택) -----------------
+static void system_main_task(void *pvParameters) {
+    Serial.println("🚀 [INIT] S3 시스템 초기화 워커 태스크 시작 (16KB 스택)");
 
     g_c2_enc = codec2_create(CODEC2_MODE_2400);
 
@@ -435,55 +442,68 @@ void setup() {
 
     if (!init_i2s_microphone()) {
         Serial.println("[FATAL] I2S 마이크 초기화 실패!");
-        while (1) delay(1000);
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     xTaskCreatePinnedToCore(audio_classifier_task, "audioTask", 32768, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(radar_task, "radarTask", 4096, nullptr, 1, nullptr, 0);
 
-    Serial.println("\n[SYSTEM READY] ESP32-S3 Codec2 PTT 시스템 가동.");
+    Serial.println("\n[SYSTEM READY] ESP32-S3 Codec2 PTT 시스템 정상 가동.\n");
+
+    // 버튼 감지 및 모드 전환 루프
+    bool prev_mode = false;
+    uint32_t btn_press_start_ms = 0;
+    bool btn_is_pressed = false;
+    bool btn_long_press_handled = false;
+
+    while (true) {
+        if (digitalRead(PIN_VOICE_CALL_BUTTON) == HIGH) {
+            if (!btn_is_pressed) {
+                btn_is_pressed = true;
+                btn_press_start_ms = millis();
+                btn_long_press_handled = false;
+            } else if (!btn_long_press_handled) {
+                if (millis() - btn_press_start_ms >= 3000U) {
+                    g_voice_call_active = !g_voice_call_active;
+                    btn_long_press_handled = true;
+                    Serial.printf("🔘 [BUTTON] 3초 롱프레스 감지 -> 모드 변경: %s\n", g_voice_call_active ? "통화 모드" : "대기 모드");
+                }
+            }
+        } else {
+            btn_is_pressed = false;
+            btn_long_press_handled = false;
+        }
+
+        if (prev_mode != g_voice_call_active) {
+            prev_mode = g_voice_call_active;
+            if (g_voice_call_active) {
+                Serial.println("[MODE CHANGE] >>> 관제소 음성 대화 활성화");
+                if (g_ble_connected && pCharEmergency != nullptr) {
+                    pCharEmergency->setValue("CALL_START");
+                    pCharEmergency->notify();
+                }
+            } else {
+                Serial.println("[MODE CHANGE] >>> 일반 대기 모드 복귀");
+                if (g_ble_connected && pCharEmergency != nullptr) {
+                    pCharEmergency->setValue("CALL_END");
+                    pCharEmergency->notify();
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+
+    // 16KB 스택을 가진 별도 태스크를 Core 0에 생성
+    xTaskCreatePinnedToCore(system_main_task, "sys_main_task", 16384, nullptr, 3, nullptr, 0);
 }
 
 void loop() {
-    static bool prev_mode = false;
-    static uint32_t btn_press_start_ms = 0;
-    static bool btn_is_pressed = false;
-    static bool btn_long_press_handled = false;
-
-    // 3초 지속 감지
-    if (digitalRead(PIN_VOICE_CALL_BUTTON) == HIGH) {
-        if (!btn_is_pressed) {
-            btn_is_pressed = true;
-            btn_press_start_ms = millis();
-            btn_long_press_handled = false;
-        } else if (!btn_long_press_handled) {
-            if (millis() - btn_press_start_ms >= 3000U) {
-                g_voice_call_active = !g_voice_call_active;
-                btn_long_press_handled = true;
-                Serial.printf("[BUTTON] 3초 롱프레스 감지 -> 모드 변경: %s\n", g_voice_call_active ? "통화 모드" : "대기 모드");
-            }
-        }
-    } else {
-        btn_is_pressed = false;
-        btn_long_press_handled = false;
-    }
-
-    if (prev_mode != g_voice_call_active) {
-        prev_mode = g_voice_call_active;
-        if (g_voice_call_active) {
-            Serial.println("[MODE CHANGE] >>> 관제소 음성 대화 활성화");
-            if (g_ble_connected && pCharEmergency != nullptr) {
-                pCharEmergency->setValue("CALL_START");
-                pCharEmergency->notify();
-            }
-        } else {
-            Serial.println("[MODE CHANGE] >>> 일반 대기 모드 복귀");
-            if (g_ble_connected && pCharEmergency != nullptr) {
-                pCharEmergency->setValue("CALL_END");
-                pCharEmergency->notify();
-            }
-        }
-    }
-
-    delay(20);
+    // 기본 loopTask는 즉시 소멸시켜 스택 메모리 환원
+    vTaskDelete(NULL);
 }
