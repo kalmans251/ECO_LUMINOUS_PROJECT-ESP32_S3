@@ -57,9 +57,11 @@ static BLECharacteristic* pCharRadar2 = nullptr;
 static BLECharacteristic* pCharAudioStream = nullptr;
 static bool g_ble_connected = false;
 
-// ----------------- 3. 전처리 및 상태 버퍼 -----------------
-static constexpr float MIC_GAIN = 2.0f;
-static constexpr float HPF_ALPHA = 0.985f;
+// ----------------- 3. 전처리 및 필터 버퍼 -----------------
+static constexpr float MIC_GAIN = 5.5f;
+static constexpr float HPF_ALPHA = 0.95f;
+static constexpr float NOISE_GATE_LEVEL = 70.0f;
+
 static float s_filter_x = 0.0f;
 static float s_filter_y = 0.0f;
 
@@ -68,29 +70,24 @@ static const float MIC_LEVEL_THRESHOLD  = 0.04f;
 
 static constexpr size_t MONO_SLICE_SIZE = EI_CLASSIFIER_SLICE_SIZE;
 static constexpr size_t STEREO_BUFFER_SIZE = MONO_SLICE_SIZE * 2;
-
 static int32_t rawStereoBuffer[STEREO_BUFFER_SIZE];
 static int16_t g_audio_slice[MONO_SLICE_SIZE];
 static size_t g_audio_slice_size = 0;
 
+#define CALL_CHUNK_SAMPLES 960
+static int32_t callRawBuffer[CALL_CHUNK_SAMPLES * 2];
+
 static float g_last_microphone_level = 0.0f;
 static uint16_t g_last_mic_avg = 0;
-static uint32_t g_last_detection_ms = 0;
+
+static uint32_t g_cooldown_until_ms = 0;
 static int g_consecutive_hits = 0;
 static int g_prev_detected_index = -1;
 
 static volatile bool g_voice_call_active = false;
+static bool g_prev_mode = false;
 
-// Codec 2 인코더
 static struct CODEC2 *g_c2_enc = nullptr;
-static int16_t g_codec2_in_buf[160]; // 8kHz 20ms = 160 samples
-static int g_codec2_in_idx = 0;
-
-// 레이더 캐시 버퍼
-static uint8_t g_radar1_latest_frame[LD2450_FRAME_LEN];
-static bool g_radar1_has_new = false;
-static uint8_t g_radar2_latest_frame[LD2450_FRAME_LEN];
-static bool g_radar2_has_new = false;
 
 // ----------------- 4. BLE 콜백 -----------------
 class ServerCallbacks: public BLEServerCallbacks {
@@ -109,13 +106,22 @@ class EmergencyCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pChar) override {
         String rxValue = pChar->getValue().c_str();
         if (rxValue.length() > 0) {
-            Serial.printf("📩 [BLE RX] 관제소 제어 명령: %s\n", rxValue.c_str());
-            if (rxValue == "CALL_END") {
+            Serial.printf("📩 [BLE RX] 원격 제어 명령 수신: %s\n", rxValue.c_str());
+
+            if (rxValue.indexOf("CALL_END") != -1) {
                 g_voice_call_active = false;
-                Serial.println("📞 [SYSTEM] 관제소 통화 종료 -> 대기 모드 복귀");
-            } else if (rxValue == "CALL_START") {
+                g_prev_mode = false;
+                g_consecutive_hits = 0;
+                g_prev_detected_index = -1;
+                g_cooldown_until_ms = millis() + 4000U;
+                i2s_zero_dma_buffer(I2S_PORT);
+
+                Serial.println("📞 [SYSTEM] >>> 통화 종료: 대기 모드 100% 즉시 복귀!");
+            } 
+            else if (rxValue.indexOf("CALL_START") != -1) {
                 g_voice_call_active = true;
-                Serial.println("🚨 [SYSTEM] 관제소 통화 활성화 -> 음성 송출 모드");
+                g_prev_mode = true;
+                Serial.println("🚨 [SYSTEM] >>> 관제소 통화 연결 가동");
             }
         }
     }
@@ -128,9 +134,13 @@ static void init_ble() {
 
     BLEService *pService = pServer->createService(SERVICE_UUID);
 
+    // [핵심] PROPERTY_WRITE_NR (Write Without Response) 필수 활성화!
     pCharEmergency = pService->createCharacteristic(
         CHAR_EMERGENCY_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE
+        BLECharacteristic::PROPERTY_READ | 
+        BLECharacteristic::PROPERTY_NOTIFY | 
+        BLECharacteristic::PROPERTY_WRITE | 
+        BLECharacteristic::PROPERTY_WRITE_NR
     );
     pCharEmergency->setCallbacks(new EmergencyCharCallbacks());
     pCharEmergency->addDescriptor(new BLE2902());
@@ -146,9 +156,7 @@ static void init_ble() {
 
     pService->start();
 
-    // 31바이트 초과 방지를 위한 분할 광고 설정
     BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-    
     BLEAdvertisementData advData;
     advData.setFlags(0x06);
     advData.setCompleteServices(BLEUUID(SERVICE_UUID));
@@ -160,20 +168,25 @@ static void init_ble() {
 
     pAdv->setMinPreferred(0x06);
     pAdv->start();
-    Serial.println("📢 [BLE] 31바이트 분할 광고 송출 시작 (GATT 서버 가동 완료)");
+    Serial.println("📢 [BLE] GATT 서버 가동 완료 (Write_NR 활성화됨)");
 }
 
-// ----------------- 5. 오디오 처리 및 I2S -----------------
-static inline int16_t processI2SSample(int32_t rawLeft) {
-    int32_t sample16 = rawLeft >> 12;
-    float x = static_cast<float>(sample16);
+static inline int16_t cleanProcessSample(int32_t rawLeft, int32_t rawRight) {
+    int32_t raw = (abs(rawLeft) > abs(rawRight)) ? rawLeft : rawRight;
+    int32_t s16 = raw >> 16;
+    float x = static_cast<float>(s16);
+
     float y = HPF_ALPHA * (s_filter_y + x - s_filter_x);
     s_filter_x = x;
     s_filter_y = y;
 
+    if (fabsf(y) < NOISE_GATE_LEVEL) {
+        return 0;
+    }
+
     float amplified = y * MIC_GAIN;
-    if (amplified > 32767.0f) amplified = 32767.0f;
-    if (amplified < -32768.0f) amplified = -32768.0f;
+    if (amplified > 32000.0f) amplified = 32000.0f;
+    if (amplified < -32000.0f) amplified = -32000.0f;
 
     return static_cast<int16_t>(amplified);
 }
@@ -206,34 +219,6 @@ static bool init_i2s_microphone() {
     return true;
 }
 
-static void capture_microphone_samples() {
-    size_t bytesRead = 0;
-    const size_t bytesToRead = STEREO_BUFFER_SIZE * sizeof(int32_t);
-
-    esp_err_t err = i2s_read(I2S_PORT, rawStereoBuffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(100));
-    if (err != ESP_OK || bytesRead == 0) {
-        g_audio_slice_size = 0;
-        return;
-    }
-
-    const size_t monoSamples = (bytesRead / sizeof(int32_t)) / 2;
-    uint32_t levelSum = 0;
-
-    for (size_t i = 0; i < monoSamples && i < MONO_SLICE_SIZE; ++i) {
-        int16_t sample = processI2SSample(rawStereoBuffer[i * 2]);
-        g_audio_slice[i] = sample;
-        levelSum += abs(sample);
-    }
-
-    g_audio_slice_size = monoSamples;
-
-    if (monoSamples > 0) {
-        g_last_mic_avg = static_cast<uint16_t>(levelSum / monoSamples);
-        g_last_microphone_level = static_cast<float>(g_last_mic_avg) / 10000.0f;
-        if (g_last_microphone_level > 1.0f) g_last_microphone_level = 1.0f;
-    }
-}
-
 static int raw_audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
     if (offset + length > g_audio_slice_size) {
         for (size_t i = 0; i < length; ++i) out_ptr[i] = 0.0f;
@@ -257,6 +242,12 @@ static const char *label_to_korean(const char *label) {
 }
 
 static void process_inference_result(const ei_impulse_result_t &result, float mic_level) {
+    if (millis() < g_cooldown_until_ms) {
+        g_consecutive_hits = 0;
+        g_prev_detected_index = -1;
+        return;
+    }
+
     if (mic_level < MIC_LEVEL_THRESHOLD) {
         g_consecutive_hits = 0;
         g_prev_detected_index = -1;
@@ -292,25 +283,24 @@ static void process_inference_result(const ei_impulse_result_t &result, float mi
     }
 
     if (g_consecutive_hits >= 2) {
-        if (millis() - g_last_detection_ms >= 2000U) {
-            g_last_detection_ms = millis();
-            const char *korean_text = label_to_korean(best_label);
+        g_cooldown_until_ms = millis() + 4000U;
+        const char *korean_text = label_to_korean(best_label);
 
-            Serial.printf("🚨 [AI 키워드 확정] %s (확신도: %.1f%%)\n", korean_text, best_confidence * 100.0f);
+        Serial.printf("🚨 [AI 키워드 감지] %s (확신도: %.1f%%)\n", korean_text, best_confidence * 100.0f);
 
-            if (g_ble_connected && pCharEmergency != nullptr) {
-                pCharEmergency->setValue(korean_text);
-                pCharEmergency->notify();
-            }
-            g_voice_call_active = true;
+        if (g_ble_connected && pCharEmergency != nullptr) {
+            pCharEmergency->setValue(korean_text);
+            pCharEmergency->notify();
         }
+        g_voice_call_active = true;
+        g_prev_mode = true;
         g_consecutive_hits = 0;
         g_prev_detected_index = -1;
     }
 }
 
-// ----------------- 6. LD2450 레이더 파서 -----------------
-static void parse_radar_stream(HardwareSerial &port, uint8_t *dest_buf, bool &new_flag, uint8_t &state_idx, uint8_t *tmp_buf) {
+// ----------------- 6. LD2450 초고속 레이더 파서 -----------------
+static void process_radar_stream(HardwareSerial &port, BLECharacteristic *pChar, uint8_t &state_idx, uint8_t *tmp_buf) {
     while (port.available() > 0) {
         uint8_t byte = port.read();
 
@@ -327,10 +317,12 @@ static void parse_radar_stream(HardwareSerial &port, uint8_t *dest_buf, bool &ne
             else { state_idx = 0; }
         } else {
             tmp_buf[state_idx++] = byte;
-            if (state_idx == LD2450_FRAME_LEN) {
+            if (state_idx >= LD2450_FRAME_LEN) {
                 if (tmp_buf[28] == 0x55 && tmp_buf[29] == 0xCC) {
-                    memcpy(dest_buf, tmp_buf, LD2450_FRAME_LEN);
-                    new_flag = true;
+                    if (g_ble_connected && pChar != nullptr && !g_voice_call_active) {
+                        pChar->setValue(tmp_buf, LD2450_FRAME_LEN);
+                        pChar->notify();
+                    }
                 }
                 state_idx = 0;
             }
@@ -338,50 +330,68 @@ static void parse_radar_stream(HardwareSerial &port, uint8_t *dest_buf, bool &ne
     }
 }
 
-// ----------------- 7. FreeRTOS 태스크 -----------------
 static void audio_classifier_task(void *arg) {
     (void)arg;
 
     while (true) {
-        capture_microphone_samples();
-
         if (g_voice_call_active) {
-            if (g_ble_connected && g_audio_slice_size > 0 && pCharAudioStream != nullptr && g_c2_enc != nullptr) {
-                static uint8_t c2_batch_buf[18];
-                static int c2_batch_idx = 0;
+            size_t bytesRead = 0;
+            const size_t bytesToRead = CALL_CHUNK_SAMPLES * 2 * sizeof(int32_t);
 
-                for (size_t i = 0; i < g_audio_slice_size; i += 2) {
-                    g_codec2_in_buf[g_codec2_in_idx++] = g_audio_slice[i];
-
-                    if (g_codec2_in_idx >= 160) {
-                        codec2_encode(g_c2_enc, &c2_batch_buf[c2_batch_idx * 6], g_codec2_in_buf);
-                        c2_batch_idx++;
-                        g_codec2_in_idx = 0;
-
-                        if (c2_batch_idx >= 3) {
-                            pCharAudioStream->setValue(c2_batch_buf, 18);
-                            pCharAudioStream->notify();
-                            c2_batch_idx = 0;
-                        }
-                    }
+            esp_err_t err = i2s_read(I2S_PORT, callRawBuffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(50));
+            if (g_voice_call_active && err == ESP_OK && bytesRead == bytesToRead && g_ble_connected && pCharAudioStream != nullptr && g_c2_enc != nullptr) {
+                
+                int16_t pcm8k[480];
+                for (int i = 0; i < 480; i++) {
+                    pcm8k[i] = cleanProcessSample(callRawBuffer[i * 4], callRawBuffer[i * 4 + 1]);
                 }
+
+                uint8_t c2_payload[18];
+                codec2_encode(g_c2_enc, &c2_payload[0],  &pcm8k[0]);
+                codec2_encode(g_c2_enc, &c2_payload[6],  &pcm8k[160]);
+                codec2_encode(g_c2_enc, &c2_payload[12], &pcm8k[320]);
+
+                pCharAudioStream->setValue(c2_payload, 18);
+                pCharAudioStream->notify();
             }
-        } else {
-            g_codec2_in_idx = 0;
-            if (g_audio_slice_size > 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } 
+        else {
+            size_t bytesRead = 0;
+            const size_t bytesToRead = STEREO_BUFFER_SIZE * sizeof(int32_t);
+
+            esp_err_t err = i2s_read(I2S_PORT, rawStereoBuffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(100));
+            if (err == ESP_OK && bytesRead > 0) {
+                const size_t monoSamples = (bytesRead / sizeof(int32_t)) / 2;
+                uint32_t levelSum = 0;
+
+                for (size_t i = 0; i < monoSamples && i < MONO_SLICE_SIZE; ++i) {
+                    int16_t sample = cleanProcessSample(rawStereoBuffer[i * 2], rawStereoBuffer[i * 2 + 1]);
+                    g_audio_slice[i] = sample;
+                    levelSum += abs(sample);
+                }
+
+                g_audio_slice_size = monoSamples;
+
+                if (monoSamples > 0) {
+                    g_last_mic_avg = static_cast<uint16_t>(levelSum / monoSamples);
+                    g_last_microphone_level = static_cast<float>(g_last_mic_avg) / 10000.0f;
+                    if (g_last_microphone_level > 1.0f) g_last_microphone_level = 1.0f;
+                }
+
                 signal_t signal;
                 signal.total_length = g_audio_slice_size;
                 signal.get_data = &raw_audio_signal_get_data;
 
                 ei_impulse_result_t result = {0};
-                EI_IMPULSE_ERROR err = run_classifier_continuous(&signal, &result, false);
+                EI_IMPULSE_ERROR ei_err = run_classifier_continuous(&signal, &result, false);
 
-                if (err == EI_IMPULSE_OK) {
+                if (ei_err == EI_IMPULSE_OK) {
                     process_inference_result(result, g_last_microphone_level);
                 }
             }
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -389,42 +399,21 @@ static void radar_task(void *arg) {
     (void)arg;
     uint8_t state1 = 0, state2 = 0;
     uint8_t tmp1[LD2450_FRAME_LEN], tmp2[LD2450_FRAME_LEN];
-    uint32_t last_tx_ms = 0;
 
     while (true) {
         if (!g_voice_call_active) {
-            parse_radar_stream(RadarSerial1, g_radar1_latest_frame, g_radar1_has_new, state1, tmp1);
-            parse_radar_stream(RadarSerial2, g_radar2_latest_frame, g_radar2_has_new, state2, tmp2);
-
-            uint32_t now = millis();
-            if (now - last_tx_ms >= 100) {
-                last_tx_ms = now;
-
-                if (g_ble_connected) {
-                    if (g_radar1_has_new && pCharRadar1 != nullptr) {
-                        pCharRadar1->setValue(g_radar1_latest_frame, LD2450_FRAME_LEN);
-                        pCharRadar1->notify();
-                        g_radar1_has_new = false;
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
-                    if (g_radar2_has_new && pCharRadar2 != nullptr) {
-                        pCharRadar2->setValue(g_radar2_latest_frame, LD2450_FRAME_LEN);
-                        pCharRadar2->notify();
-                        g_radar2_has_new = false;
-                    }
-                }
-            }
+            process_radar_stream(RadarSerial1, pCharRadar1, state1, tmp1);
+            process_radar_stream(RadarSerial2, pCharRadar2, state2, tmp2);
         } else {
             while (RadarSerial1.available()) RadarSerial1.read();
             while (RadarSerial2.available()) RadarSerial2.read();
             state1 = 0;
             state2 = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-// ----------------- 8. [핵심] 시스템 메인 워커 태스크 (16KB 스택) -----------------
 static void system_main_task(void *pvParameters) {
     Serial.println("🚀 [INIT] S3 시스템 초기화 워커 태스크 시작 (16KB 스택)");
 
@@ -448,10 +437,8 @@ static void system_main_task(void *pvParameters) {
     xTaskCreatePinnedToCore(audio_classifier_task, "audioTask", 32768, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(radar_task, "radarTask", 4096, nullptr, 1, nullptr, 0);
 
-    Serial.println("\n[SYSTEM READY] ESP32-S3 Codec2 PTT 시스템 정상 가동.\n");
+    Serial.println("\n[SYSTEM READY] ESP32-S3 고음질 Codec2 PTT 시스템 가동.\n");
 
-    // 버튼 감지 및 모드 전환 루프
-    bool prev_mode = false;
     uint32_t btn_press_start_ms = 0;
     bool btn_is_pressed = false;
     bool btn_long_press_handled = false;
@@ -474,8 +461,8 @@ static void system_main_task(void *pvParameters) {
             btn_long_press_handled = false;
         }
 
-        if (prev_mode != g_voice_call_active) {
-            prev_mode = g_voice_call_active;
+        if (g_prev_mode != g_voice_call_active) {
+            g_prev_mode = g_voice_call_active;
             if (g_voice_call_active) {
                 Serial.println("[MODE CHANGE] >>> 관제소 음성 대화 활성화");
                 if (g_ble_connected && pCharEmergency != nullptr) {
@@ -498,12 +485,9 @@ static void system_main_task(void *pvParameters) {
 void setup() {
     Serial.begin(115200);
     delay(200);
-
-    // 16KB 스택을 가진 별도 태스크를 Core 0에 생성
     xTaskCreatePinnedToCore(system_main_task, "sys_main_task", 16384, nullptr, 3, nullptr, 0);
 }
 
 void loop() {
-    // 기본 loopTask는 즉시 소멸시켜 스택 메모리 환원
     vTaskDelete(NULL);
 }
