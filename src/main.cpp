@@ -85,6 +85,7 @@ static int g_consecutive_hits = 0;
 static int g_prev_detected_index = -1;
 
 static volatile bool g_voice_call_active = false;
+static volatile bool g_ai_voice_enabled = true; // 💡 [추가] AI 음성인식 활성화 플래그
 static bool g_prev_mode = false;
 
 static struct CODEC2 *g_c2_enc = nullptr;
@@ -104,20 +105,35 @@ class EmergencyCharCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pChar) override {
         String rxValue = pChar->getValue().c_str();
         if (rxValue.length() > 0) {
-            // 💡 [핵심] 원격 통화 종료 수신 시 즉시 모든 플래그 강제 클리어
+            // 💡 [원격 통화 종료]
             if (rxValue.indexOf("CALL_END") != -1) {
                 g_voice_call_active = false;
                 g_prev_mode = false;
                 g_consecutive_hits = 0;
                 g_prev_detected_index = -1;
-                g_cooldown_until_ms = millis() + 4000U; // 4초 쿨다운
+                g_cooldown_until_ms = millis() + 4000U;
                 i2s_zero_dma_buffer(I2S_PORT);
                 Serial.println("📞 [S3] >>> 관제소 통화 종료: 즉시 일반 대기 모드 복귀");
             } 
+            // 💡 [원격 통화 시작]
             else if (rxValue.indexOf("CALL_START") != -1) {
                 g_voice_call_active = true;
                 g_prev_mode = true;
                 Serial.println("🚨 [S3] >>> 관제소 통화 시작");
+            }
+            // 💡 [핵심 추가] AI 음성인식 원격 ON/OFF 명령 파싱
+            else if (rxValue.indexOf("$AIVOICE,0") != -1) {
+                g_ai_voice_enabled = false;
+                g_consecutive_hits = 0;
+                g_prev_detected_index = -1;
+                i2s_zero_dma_buffer(I2S_PORT);
+                Serial.println("🤖 [S3] >>> AI 음성인식 비활성화 (OFF)");
+            }
+            else if (rxValue.indexOf("$AIVOICE,1") != -1) {
+                g_ai_voice_enabled = true;
+                g_cooldown_until_ms = millis() + 1000U; // 복귀 시 1초 안정화 쿨다운
+                i2s_zero_dma_buffer(I2S_PORT);
+                Serial.println("🤖 [S3] >>> AI 음성인식 활성화 (ON)");
             }
         }
     }
@@ -193,7 +209,7 @@ static bool init_i2s_microphone() {
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 16,     // 💡 [패치] 기존 8에서 16으로 증가 (AI 추론 시간 확보 및 오버플로우 방지)
+        .dma_buf_count = 16,
         .dma_buf_len = 256,
         .use_apll = false,
         .tx_desc_auto_clear = false,
@@ -330,13 +346,11 @@ static void audio_classifier_task(void *arg) {
             size_t bytesRead = 0;
             const size_t bytesToRead = CALL_CHUNK_SAMPLES * 2 * sizeof(int32_t);
 
-            // 💡 [패치] 타임아웃을 50ms -> 100ms로 늘림 (60ms 묶음을 안정적으로 수신)
             esp_err_t err = i2s_read(I2S_PORT, callRawBuffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(100));
             if (g_voice_call_active && err == ESP_OK && bytesRead == bytesToRead && g_ble_connected && pCharAudioStream != nullptr && g_c2_enc != nullptr) {
                 
                 int16_t pcm8k[480];
                 for (int i = 0; i < 480; i++) {
-                    // 💡 [패치] 16kHz -> 8kHz 나이브 다운샘플링 명시 적용 (1샘플 건너뛰기)
                     pcm8k[i] = cleanProcessSample(callRawBuffer[i * 4], callRawBuffer[i * 4 + 1]);
                 }
 
@@ -351,10 +365,15 @@ static void audio_classifier_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(2));
         } 
         else {
+            // 💡 [핵심] AI 음성인식이 꺼져 있으면 I2S 캡처 및 신경망 추론 연산을 건너뛰고 대기
+            if (!g_ai_voice_enabled) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
             size_t bytesRead = 0;
             const size_t bytesToRead = STEREO_BUFFER_SIZE * sizeof(int32_t);
 
-            // 💡 [패치] 일반 모드에서도 타임아웃을 150ms로 충분히 부여
             esp_err_t err = i2s_read(I2S_PORT, rawStereoBuffer, bytesToRead, &bytesRead, pdMS_TO_TICKS(150));
             if (err == ESP_OK && bytesRead > 0) {
                 const size_t monoSamples = (bytesRead / sizeof(int32_t)) / 2;
@@ -430,7 +449,6 @@ static void system_main_task(void *pvParameters) {
     bool btn_is_pressed = false;
     bool btn_long_press_handled = false;
 
-    // 💡 [패치] 초기 상태 강제 동기화 (무한 Notify 방지)
     g_prev_mode = g_voice_call_active;
 
     while (true) {
@@ -443,7 +461,6 @@ static void system_main_task(void *pvParameters) {
                 if (millis() - btn_press_start_ms >= 3000U) {
                     g_voice_call_active = !g_voice_call_active;
                     btn_long_press_handled = true;
-                    // 💡 상태 변환 디버그 로그 추가
                     Serial.println(g_voice_call_active ? "🎙️ 물리버튼: 통화 시작" : "🔇 물리버튼: 통화 종료");
                 }
             }
@@ -452,7 +469,6 @@ static void system_main_task(void *pvParameters) {
             btn_long_press_handled = false;
         }
 
-        // 💡 [패치] 상태가 변경되었을 때만 단 1번 BLE 발송 처리
         if (g_prev_mode != g_voice_call_active) {
             g_prev_mode = g_voice_call_active;
             
@@ -466,12 +482,10 @@ static void system_main_task(void *pvParameters) {
                     pCharEmergency->setValue("CALL_END");
                     pCharEmergency->notify();
                 }
-                // 💡 [패치] 통화 종료 후 이전 쓰레기 데이터가 AI에 들어가는 것을 막기 위해 버퍼 비우기
                 i2s_zero_dma_buffer(I2S_PORT);
             }
         }
 
-        // 💡 [패치] 루프 간격을 20ms -> 50ms로 늘려 CPU 점유율 감소 및 통신 안정화
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -484,4 +498,4 @@ void setup() {
 
 void loop() {
     vTaskDelete(NULL);
-}
+} 
